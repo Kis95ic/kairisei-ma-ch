@@ -136,6 +136,9 @@ func (engine *BattleEngine) branchConditionSatisfied(condition string, parameter
 			total += other.skill.Cost
 		}
 		return combatValueInRange(total, parameters[0], parameters[1])
+	case "SELF_PLAY_COST_TOTAL_AND_CHAIN":
+		return engine.branchConditionSatisfied("SELF_PLAY_COST_TOTAL", [5]string{parameters[0], parameters[1]}, action, actions, chainCounts) &&
+			engine.branchConditionSatisfied("DECK_COMBO_COUNT", [5]string{parameters[2], parameters[3]}, action, actions, chainCounts)
 	case "SELF_PLAY_COST_NUM":
 		count := 0
 		for _, other := range selectedActionsByMember(actions, action.memberType) {

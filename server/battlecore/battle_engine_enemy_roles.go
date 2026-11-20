@@ -1341,7 +1341,7 @@ func SupportsEnemyBranchCondition(condition string) bool {
 
 func SupportsPlayerBranchCondition(condition string) bool {
 	switch strings.ToUpper(strings.TrimSpace(condition)) {
-	case "FRIEND_PLAY_COST_NUM":
+	case "FRIEND_PLAY_COST_NUM", "SELF_PLAY_COST_TOTAL_AND_CHAIN":
 		return true
 	case "USER_ATTACK", "USER_ATTACK_NUM", "TARGET_ENEMY_CHARGE_START", "ENEMY_DEAD_NOW_TURN":
 		return true

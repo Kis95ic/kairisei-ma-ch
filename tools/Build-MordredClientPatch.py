@@ -1,4 +1,4 @@
-"""Stage the existing Mordred CSV patch in Windows downloadable resources.
+"""Stage reviewed card CSV patches in platform-specific downloadable resources.
 
 Requires UnityPy (the local investigation environment is also supported).
 Never writes to the installed server or client. Does not change skill semantics.
@@ -11,6 +11,7 @@ import csv
 import gzip
 import hashlib
 import io
+import importlib
 import json
 from pathlib import Path
 import sys
@@ -72,13 +73,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server-dir", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--platform", choices=("pc", "android"), default="pc")
+    parser.add_argument("--master-patch", type=Path,
+                        help="reviewed CardMod2 resource-set directory; otherwise use the original Mordred workflow")
     args = parser.parse_args()
     server, output = args.server_dir.resolve(), args.output.resolve()
     require(not output.exists(), "Output must be a new directory")
     require(not output.is_relative_to(server), "Output must be outside the installation")
-    platform = server / "platform/pc"
+    platform = server / "platform" / args.platform
     profile = json.loads((platform / "delivery.json").read_text(encoding="utf-8-sig"))
-    require(profile["platform"] == "StandaloneWindows64", "Expected Windows profile")
+    require(profile["platform"] == ("StandaloneWindows64" if args.platform == "pc" else "Android"), "Unexpected platform profile")
     require(profile["artifact_root"] == ".", "Expected the portable package layout")
     movie = json.loads((platform / profile["movies"]["file"]).read_text(encoding="utf-8-sig"))
     require(content_id(profile, movie) == profile["content_id"], "Original content ID mismatch")
@@ -94,7 +98,18 @@ def main():
     require(sha(catalog_bytes) == profile["catalog"]["sha256"], "Original catalog hash mismatch")
     catalog = gzip.decompress(catalog_bytes)
 
-    source = server / "resource-set/_local/control/server"
+    master_patch = args.master_patch.resolve() if args.master_patch else None
+    patch_receipt = None
+    if master_patch:
+        patch_receipt = json.loads((master_patch / "patch.json").read_text(encoding="utf-8"))
+        mod2 = importlib.import_module("Build-CardMod2Patch")
+        require(patch_receipt.get("schema") == 2 and patch_receipt.get("spec_sha256") == mod2.SPEC_SHA256,
+                "Expected the reviewed CardMod2 patch")
+        require({r["card_id"] for r in patch_receipt["cards"]} == mod2.CARD_IDS,
+                "Unexpected CardMod2 card inventory")
+        require(not patch_receipt.get("deferred_card_ids"), "Incomplete final patch")
+    source_root = master_patch if master_patch else server / "resource-set"
+    source = source_root / "_local/control/server"
     table_folders = {
         "card.csv": "cn602-card-master",
         "skill_player.csv": "cn602-battle-master",
@@ -107,16 +122,22 @@ def main():
     for name, folder in table_folders.items():
         path = source / folder / name
         raw = path.read_bytes()
-        source_pins[str(path.relative_to(server)).replace("\\", "/")] = sha(raw)
+        relative = path.relative_to(source_root).as_posix()
+        if patch_receipt:
+            require(sha(raw) == patch_receipt["files"][relative]["after_sha256"], f"Patch checksum mismatch: {name}")
+            backup = master_patch / "backup" / relative
+            require(sha(backup.read_bytes()) == patch_receipt["files"][relative]["before_sha256"], f"Backup checksum mismatch: {name}")
+        source_pins["resource-set/" + relative] = sha(raw)
         source_rows[name] = list(csv.reader(io.StringIO(raw.decode("utf-8-sig"))))
     card = [r for r in source_rows["card.csv"] if r and r[0] == "10219001"]
-    require(len(card) == 1 and card[0][39] == "91021900" and card[0][46] == "91021908",
+    require(len(card) == 1 and (card[0][39], card[0][46]) ==
+            (("93000000", "93000050") if patch_receipt else ("91021900", "91021908")),
             "Install the matching server CSV patch first")
 
     env = UnityPy.load(original)
     before = {o.path_id: sha(o.get_raw_data()) for o in env.objects}
     changed, expected = {}, {}
-    new_ids = {str(i) for i in range(91021900, 91021909)}
+    new_ids = {str(i) for i in (patch_receipt["new_ids"] if patch_receipt else range(91021900, 91021909))}
     for obj in env.objects:
         if obj.type.name != "TextAsset":
             continue
@@ -133,18 +154,31 @@ def main():
         old_rows = list(csv.reader(io.StringIO(decoded)))
         require(not any(r and r[0] in new_ids for r in old_rows), f"Already patched: {name}")
         if name == "card.csv":
-            matches = [r for r in old_rows if r and r[0] == "10219001"]
-            require(len(matches) == 1 and matches[0][39] == "11106962"
-                    and matches[0][46] == "63000760", "Unexpected original card")
-            lines = raw.splitlines(keepends=True)
-            indices = [i for i, line in enumerate(lines) if line.startswith(b"10219001,")]
-            require(len(indices) == 1, "Card must occupy a single CSV record")
-            replacement = matches[0].copy()
-            replacement[39], replacement[46] = "91021900", "91021908"
-            index = indices[0]
-            ending = b"\r\n" if lines[index].endswith(b"\r\n") else b"\n"
-            lines[index] = encode_rows([replacement], encoding).rstrip(b"\n") + ending
-            updated = b"".join(lines)
+            if patch_receipt:
+                backup_rows = mod2.read_rows((master_patch / "backup/_local/control/server/cn602-card-master/card.csv").read_bytes())
+                originals = {card_id: mod2.unique_row(old_rows, card_id) for card_id in mod2.CARD_IDS}
+                replacements = {}
+                for card_id, original_card in originals.items():
+                    baseline_card = mod2.unique_row(backup_rows, card_id)
+                    normalized = original_card.copy()
+                    if card_id == 10219001 and (normalized[39], normalized[46]) == ("91021900", "91021908"):
+                        normalized[39], normalized[46] = baseline_card[39], baseline_card[46]
+                    require(normalized == baseline_card, f"Unreviewed client card difference: {card_id}")
+                    replacements[card_id] = mod2.unique_row(source_rows[name], card_id)
+                updated = mod2.replace_cards(raw, replacements, originals)
+            else:
+                matches = [r for r in old_rows if r and r[0] == "10219001"]
+                require(len(matches) == 1 and matches[0][39] == "11106962"
+                        and matches[0][46] == "63000760", "Unexpected original card")
+                lines = raw.splitlines(keepends=True)
+                indices = [i for i, line in enumerate(lines) if line.startswith(b"10219001,")]
+                require(len(indices) == 1, "Card must occupy a single CSV record")
+                replacement = matches[0].copy()
+                replacement[39], replacement[46] = "91021900", "91021908"
+                index = indices[0]
+                ending = b"\r\n" if lines[index].endswith(b"\r\n") else b"\n"
+                lines[index] = encode_rows([replacement], encoding).rstrip(b"\n") + ending
+                updated = b"".join(lines)
         else:
             additions = [r for r in source_rows[name] if r and r[0] in new_ids]
             require(additions, f"No patch rows in {name}")
@@ -153,6 +187,8 @@ def main():
                 validate_skill_variants(additions, conditions)
             else:
                 validate_role_counts(additions)
+                known_functions = {r[8] for r in old_rows if len(r) >= 33}
+                require(all(r[8] in known_functions for r in additions), "Effect absent from platform master")
             updated = raw + (b"\n" if not raw.endswith(b"\n") else b"") + encode_rows(additions, encoding)
         expected[name] = updated
         asset.m_Script = updated.decode("utf-8", "surrogateescape")
@@ -189,13 +225,13 @@ def main():
     require(profile["content_id"] != old_profile["content_id"], "Content version did not change")
 
     files = {
-        "platform/pc/bundles/main_c/container.dat": rebuilt,
-        "platform/pc/catalog.dat": rebuilt_catalog,
-        "platform/pc/delivery.json": (json.dumps(profile, ensure_ascii=False, indent=2) + "\n").encode(),
+        f"platform/{args.platform}/bundles/main_c/container.dat": rebuilt,
+        f"platform/{args.platform}/catalog.dat": rebuilt_catalog,
+        f"platform/{args.platform}/delivery.json": (json.dumps(profile, ensure_ascii=False, indent=2) + "\n").encode(),
     }
     receipt = {
         "card_id": 10219001,
-        "scope": "Windows download resources; preserves the existing server skill definitions",
+        "scope": f"{args.platform} download resources; preserves the existing server skill definitions",
         "old_content_id": old_profile["content_id"],
         "content_id": profile["content_id"],
         "source_master_sha256": source_pins,
@@ -205,6 +241,11 @@ def main():
         "known_limit": "Schema and resource checks do not replace in-game display and battle verification.",
         "files": {},
     }
+    if patch_receipt:
+        del receipt["card_id"]
+        receipt.update(card_ids=sorted(mod2.CARD_IDS), preserved_card_ids=[],
+                       spec_sha256=patch_receipt["spec_sha256"],
+                       scope=f"{args.platform} resources for all 60 final CardMod2 cards")
     for relative, data in files.items():
         old = (server / relative).read_bytes()
         target = output / "overlay" / relative
